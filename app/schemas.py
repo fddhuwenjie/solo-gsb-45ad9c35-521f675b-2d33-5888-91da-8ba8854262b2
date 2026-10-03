@@ -850,6 +850,80 @@ class CarbonReportResponse(BaseModel):
     created_at: str = Field(..., description="报告生成时间（UTC ISO-8601）")
 
 
+# -------------------------------------------------------------- statements
+
+
+class StatementCycleIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str = Field(
+        ..., min_length=1, max_length=64,
+        description="已关账且已生成碳排报告的账期 ID",
+    )
+    detail_digest: str = Field(
+        ..., description="期望的关账快照 detail_digest（64 位小写十六进制）；"
+        "格式非法拒绝（400 invalid_digest），与事务中重读的关账摘要不一致"
+        "即整体拒绝（409 detail_digest_mismatch）",
+    )
+    report_digest: str = Field(
+        ..., description="期望的碳排报告 report_digest（64 位小写十六进制）；"
+        "格式非法拒绝（400 invalid_digest），与事务中重读的报告摘要不一致"
+        "即整体拒绝（409 report_digest_mismatch）",
+    )
+
+
+class StatementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    statement_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="唯一声明 ID（字母/数字开头，可含 _/-）；同 ID 同内容"
+        "重放原声明（200），换账期列表或摘要冲突（409 statement_conflict）",
+    )
+    cycles: list[StatementCycleIn] = Field(
+        ..., min_length=1, max_length=12,
+        description="1～12 个账期及其期望摘要；账期不得重复，声明按关账"
+        "时间排序输出",
+    )
+
+
+class StatementCycleOut(BaseModel):
+    cycle_id: str
+    version: str = Field(..., description="账期锁定的规则版本号")
+    revision: int = Field(..., description="关账时账期的 revision（与碳排报告一致）")
+    close_id: str = Field(..., description="该账期的关账 ID")
+    closed_at: str = Field(..., description="关账时间（UTC ISO-8601），声明按它排序")
+    detail_digest: str = Field(..., description="关账快照的明细 SHA-256")
+    report_digest: str = Field(..., description="碳排报告的 SHA-256")
+    factor_version: str = Field(..., description="碳排报告使用的因子数据集版本")
+    total_energy: str = Field(..., description="该账期总用量（取自关账快照，精确值）")
+    total_amount: str = Field(..., description="该账期总金额（取自关账快照，两位小数）")
+    total_emissions: str = Field(
+        ..., description="该账期总排放量 kgCO2e（取自碳排报告，六位小数）")
+    carbon_intensity: str = Field(
+        ..., description="该账期碳强度 kgCO2e/能量单位（排放量/用量，六位小数）")
+
+
+class StatementResponse(BaseModel):
+    statement_id: str = Field(..., description="声明 ID（请求体回显）")
+    cycle_count: int = Field(..., description="汇总账期数（1～12）")
+    currency: str = Field(..., description="全部账期一致的币种")
+    energy_unit: str = Field(..., description="全部账期一致的能量单位")
+    emission_unit: str = Field(..., description="排放量单位，固定 kgCO2e")
+    cycles: list[StatementCycleOut] = Field(
+        ..., description="逐账期汇总（按关账时间排序，同刻按 cycle_id 字典序）")
+    total_energy: str = Field(..., description="各账期总用量之和（精确值，守恒）")
+    total_amount: str = Field(
+        ..., description="各账期总金额之和（两位小数，守恒；取自快照而非重算）")
+    total_emissions: str = Field(
+        ..., description="各账期总排放量之和 kgCO2e（六位小数，守恒）")
+    carbon_intensity: str = Field(
+        ..., description="综合碳强度：总排放量/总用量（六位小数）")
+    statement_digest: str = Field(
+        ..., description="声明确定性内容（除 created_at 外）的规范 JSON SHA-256")
+    created_at: str = Field(..., description="声明生成时间（UTC ISO-8601）")
+
+
 # ------------------------------------------------------------------ backup
 
 

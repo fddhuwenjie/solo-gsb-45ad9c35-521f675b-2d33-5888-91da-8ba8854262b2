@@ -58,6 +58,10 @@ SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tari
   （生成时 revision、factor_version、因子内容摘要与报告摘要的双重
   SHA-256、总排放量、完整报告 JSON）；每个账期至多一行，同 revision
   同因子重放、换因子或 revision 冲突。
+- `statements`：`POST /statements` 的**不可变综合声明**（唯一
+  statement_id、规范化请求摘要与声明摘要的双重 SHA-256、账期数、
+  合计用量/金额/排放、完整声明 JSON）；每个 statement_id 至多一行，
+  同内容重放、换账期列表或摘要冲突。
 - `database_backups`：`POST /backups/{id}` 的备份登记（backup_id、
   文件名、字节数、SHA-256、发布时间），用于幂等重放、不可覆盖判定与
   重启后的下载/核对；备份文件本身位于数据卷的 `backups/` 目录。
@@ -1216,6 +1220,97 @@ curl -s -X POST localhost:8000/cycles/demo-2024-07/carbon \
 curl -s localhost:8000/cycles/demo-2024-07/carbon
 ```
 
+### `POST /statements`
+
+把 **1～12 个已关账账期**汇总成一份**综合结算与碳排声明**。请求为每个
+账期提交期望的 `detail_digest`（关账快照摘要，见
+`POST /cycles/{cycle_id}/close`）与 `report_digest`（碳排报告摘要，见
+`POST /cycles/{cycle_id}/carbon`）：
+
+```json
+{
+  "statement_id": "stmt-2024-07",
+  "cycles": [
+    {"cycle_id": "demo-2024-07-w1",
+     "detail_digest": "3a9c…", "report_digest": "e1f9…"},
+    {"cycle_id": "demo-2024-07-w2",
+     "detail_digest": "77b2…", "report_digest": "0d44…"}
+  ]
+}
+```
+
+处理语义（全部在**同一 SQLite 事务**中完成，任一失败整体回滚、不落库）：
+
+1. **先判幂等**：同 `statement_id` 已有声明时，同内容（账期 + 两个摘要
+   按 cycle_id 排序取 SHA-256，**请求中账期的罗列顺序不影响判定**）
+   重放原声明（HTTP **200**，不写库）；换账期列表或换摘要 →
+   **409 `statement_conflict`**。
+2. **逐账期重读** `CycleClosure` 与 `CarbonReport`：账期不存在 →
+   **404 `cycle_not_found`**；尚未关账 → **409 `cycle_not_closed`**；
+   没有碳排报告 → **409 `carbon_report_missing`**；期望摘要与持久化
+   摘要不符 → **409 `detail_digest_mismatch` /
+   `report_digest_mismatch`**；报告 revision 与关账 revision 不一致
+   （报告不是针对关账状态生成的）→ **409 `revision_mismatch`**。
+3. **跨账期核对**：各账期规则版本的**币种**与**能量单位**必须一致
+   （**409 `incompatible_cycles`**）；各账期关账快照中的 UTC 用量区间
+   不得重叠（首尾相接允许，**409 `cycle_interval_overlap`**）。
+4. 请求自检：账期重复 → **400 `duplicate_cycle`**；摘要不是 64 位小写
+   十六进制 → **400 `invalid_digest`**；`statement_id` 非法 →
+   **400 `invalid_statement_id`**；账期数超出 1～12 → **422**。
+5. 全部通过后按**关账时间**（同刻按 cycle_id 字典序）输出逐账期
+   总用量、总金额、总排放与**碳强度**（排放量/用量，六位小数），并给出
+   三者合计与综合碳强度。**金额、用量、排放分别守恒**：合计直接取自
+   关账快照与碳排报告的持久化数值之和，**不从实时批次重算**。
+
+首次生成返回 **201**（节选）：
+
+```json
+{
+  "statement_id": "stmt-2024-07",
+  "cycle_count": 2,
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "emission_unit": "kgCO2e",
+  "cycles": [
+    {"cycle_id": "demo-2024-07-w1", "version": "us-ny-demo-v2024",
+     "revision": 2, "close_id": "close-w1",
+     "closed_at": "2026-10-01T08:00:00+00:00",
+     "detail_digest": "3a9c…", "report_digest": "e1f9…",
+     "factor_version": "grid-2024-v1",
+     "total_energy": "120", "total_amount": "18.60",
+     "total_emissions": "48.000000", "carbon_intensity": "0.400000"}
+  ],
+  "total_energy": "240",
+  "total_amount": "37.20",
+  "total_emissions": "96.000000",
+  "carbon_intensity": "0.400000",
+  "statement_digest": "b7d1…",
+  "created_at": "2026-10-03T08:00:00+00:00"
+}
+```
+
+- `statement_digest`：声明确定性内容（除 `created_at` 外）的规范 JSON
+  SHA-256，供离线核对；声明**不可变**，每个 `statement_id` 至多一份。
+- 声明只读取关账快照与碳排报告，**不改变任何账期状态**；账期在声明
+  生成后仍按自身接口幂等重放。
+
+**幂等与冲突**：
+
+| 情形 | 结果 |
+| --- | --- |
+| 同 `statement_id` 同内容（含账期顺序不同的等价请求）重放 | **200**，逐字节返回首次声明，不写库 |
+| 同 `statement_id` 换账期列表或换摘要 | **409 `statement_conflict`**，`details` 给出两次摘要 |
+| 任一账期缺失 / 未关账 / 无碳排报告 / 摘要不符 / revision 不一致 / 币种或能量单位不一致 / 跨账期区间重叠 | 对应 4xx，**整体拒绝且不落库** |
+
+### `GET /statements/{statement_id}`
+
+查询已保存的**不可变综合声明**（响应体与首次生成**逐字节一致**）。声明
+不存在 → **404 `statement_not_found`**。
+
+```bash
+curl -s localhost:8000/statements/stmt-2024-07
+```
+
 ### `POST /backups/{backup_id}`
 
 **服务不暂停**地导出可迁移的 SQLite 快照，供离线核对。调用方指定一个
@@ -1290,6 +1385,8 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | GET | `/cycles/{cycle_id}/close` | 查询不可变关账快照（账期不存在 404、未关账 404 closure_not_found；见上） |
 | POST | `/cycles/{cycle_id}/carbon` | 账期碳排快照：UTC 半开区间排放因子（不重叠、完整覆盖用量），用量/计价分段/因子边界取并集切原子段，逐段给出批次、费率规则、因子与排放量；expected_revision 乐观锁、关账后读快照、不可变报告幂等重放（见上） |
 | GET | `/cycles/{cycle_id}/carbon` | 查询不可变碳排报告（账期不存在 404、无报告 404 carbon_report_not_found；见上） |
+| POST | `/statements` | 跨账期综合结算与碳排声明：1～12 个已关账账期，单事务重读关账快照与碳排报告并核对期望摘要，按关账时间排序输出逐账期用量/金额/排放/碳强度与守恒合计；同 statement_id 同内容重放、换内容冲突（见上） |
+| GET | `/statements/{statement_id}` | 查询不可变综合声明（不存在 404 statement_not_found；见上） |
 | POST | `/backups/{backup_id}` | 服务不暂停的在线 SQLite 快照：Online Backup API 分批复制、integrity_check、SHA-256/字节数、原子发布、幂等重放、不可覆盖（见上） |
 | GET | `/backups/{backup_id}` | 查询已发布备份的元数据（下载地址、摘要、字节数；见上） |
 | GET | `/backups/{backup_id}/download` | 下载已发布的自包含 SQLite 副本（见上） |
@@ -1328,6 +1425,17 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | 409 | `factor_gap` | `/cycles/{id}/carbon` 的排放因子未完整覆盖账期用量；`details` 给出首个未覆盖时刻与所属区间 |
 | 409 | `carbon_conflict` | 账期已有同 revision 的不可变碳排报告，本次请求换了因子版本或因子内容 |
 | 404 | `carbon_report_not_found` | `GET /cycles/{cycle_id}/carbon` 查询的账期存在但还没有碳排报告 |
+| 400 | `invalid_statement_id` | 声明 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` |
+| 400 | `invalid_digest` | `/statements` 的期望摘要不是 64 位小写十六进制 |
+| 400 | `duplicate_cycle` | `/statements` 的账期列表中同一账期出现多次 |
+| 409 | `cycle_not_closed` | `/statements` 的账期尚未关账，不能并入综合声明 |
+| 409 | `carbon_report_missing` | `/statements` 的账期已关账但还没有碳排报告 |
+| 409 | `detail_digest_mismatch` / `report_digest_mismatch` | `/statements` 提交的期望摘要与事务中重读的关账快照/碳排报告摘要不一致 |
+| 409 | `revision_mismatch` | `/statements` 的账期碳排报告 revision 与关账 revision 不一致（报告不是针对关账状态生成的） |
+| 409 | `incompatible_cycles` | `/statements` 各账期规则版本的币种或能量单位不一致 |
+| 409 | `cycle_interval_overlap` | `/statements` 各账期关账快照中的 UTC 用量区间相互重叠（首尾相接允许） |
+| 409 | `statement_conflict` | 同一 `statement_id` 已用于内容不同的声明（换账期列表/换摘要）；声明不可变，只能同内容重放 |
+| 404 | `statement_not_found` | `GET /statements/{statement_id}` 查询的声明不存在 |
 | 400 | `invalid_backup_id` | 备份 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `backup_not_found` | 查询/下载一个尚未发布的备份 |
 | 410 | `backup_file_missing` | 有登记行但备份文件在数据卷上缺失（正常不会出现，重启清扫会移除该行） |

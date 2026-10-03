@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from . import (
     allocation, backup, carbon, closing, demand, diff, estimate, importer,
-    meter, pricing, settlement, shiftplan,
+    meter, pricing, settlement, shiftplan, statement,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -55,6 +55,8 @@ from .schemas import (
     ShiftPlanResponse,
     ShiftSegmentOut,
     ShiftTaskOut,
+    StatementRequest,
+    StatementResponse,
     TierOut,
     UsageEstimateRequest,
     UsageEstimateResponse,
@@ -314,6 +316,40 @@ def get_cycle_carbon(cycle_id: str):
     404 ``carbon_report_not_found``。
     """
     return carbon.get_report(cycle_id)
+
+
+# --------------------------------------------------------------- statements
+
+
+@app.post("/statements", response_model=StatementResponse, status_code=201,
+          tags=["statements"])
+def post_statement(req: StatementRequest, response: Response):
+    """把 1～12 个**已关账**账期汇总成一份综合结算与碳排声明。
+
+    请求为每个账期提交期望的 ``detail_digest``（关账快照摘要）与
+    ``report_digest``（碳排报告摘要）。服务在**同一 SQLite 事务**中重读
+    CycleClosure 与 CarbonReport：确认账期均已关账、报告 revision 与关账
+    revision 一致、规则币种与能量单位一致、各账期 UTC 区间不重叠；任一
+    缺失、摘要不符、重复账期或状态不合即整体拒绝且不落库。成功后按关账
+    时间排序输出逐账期总用量、金额、排放与碳强度，并给出三者合计（直接
+    取自快照/报告的持久化数值，不从实时批次重算）与规范 JSON 的
+    ``statement_digest``。同 ``statement_id`` 同内容重放原声明（200），
+    换账期列表或摘要冲突（409 ``statement_conflict``）。
+    """
+    result = statement.create_statement(req)
+    if result.replayed:
+        response.status_code = 200
+    return result.body
+
+
+@app.get("/statements/{statement_id}", response_model=StatementResponse,
+         tags=["statements"])
+def get_statement(statement_id: str):
+    """查询已保存的不可变综合声明（响应体与首次生成逐字节一致）。
+
+    声明不存在返回 404 ``statement_not_found``。
+    """
+    return statement.get_statement(statement_id)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,

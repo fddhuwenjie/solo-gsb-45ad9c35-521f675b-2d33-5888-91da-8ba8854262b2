@@ -307,6 +307,36 @@ class CarbonReport(Base):
     created_at: Mapped[str] = mapped_column(String(40))
 
 
+class Statement(Base):
+    """跨账期的综合结算与碳排声明（每个 statement_id 至多一行，不可变）。
+
+    由 ``POST /statements`` 在单个 SQLite 写事务内生成：重读各账期的
+    不可变关账快照与碳排报告（均为 closed、报告 revision 与关账 revision
+    一致、币种与能量单位一致、账期间隔在 UTC 上不重叠），核对调用方提交
+    的 detail_digest / report_digest 后，按关账时间排序汇总逐账期总用量、
+    金额、排放与碳强度；合计直接取自快照/报告的持久化数值（不从实时批次
+    重算）。``content_digest`` 是规范化请求（账期 + 两个摘要，按 cycle_id
+    排序）的 SHA-256，用于幂等重放/冲突判定；``statement_digest`` 是声明
+    确定性内容（除 created_at 外）的 SHA-256，供离线核对。
+    """
+
+    __tablename__ = "statements"
+
+    statement_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cycle_count: Mapped[int] = mapped_column(Integer)
+    # 规范化请求（账期 + detail/report 摘要，按 cycle_id 排序）的 SHA-256。
+    content_digest: Mapped[str] = mapped_column(String(64))
+    # 声明确定性内容（除 created_at 外）的规范 JSON SHA-256。
+    statement_digest: Mapped[str] = mapped_column(String(64))
+    currency: Mapped[str] = mapped_column(String(8))
+    energy_unit: Mapped[str] = mapped_column(String(16))
+    total_energy: Mapped[str] = mapped_column(String(64))
+    total_amount: Mapped[str] = mapped_column(String(32))
+    total_emissions: Mapped[str] = mapped_column(String(64))
+    statement_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 class DatabaseBackup(Base):
     """在线备份登记：backup_id -> 已发布备份文件的摘要元数据。
 
